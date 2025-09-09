@@ -366,7 +366,7 @@ namespace EsaLogistica.Api.Services
         {
             return new CabeceraDto
             {
-                TipoCodigo = pedido.tipoCodigo,
+                TipoCodigo = "05",
                 Categoria = pedido.categoria,
                 Sucursal = pedido.sucursal,
                 Numero = pedido.numero,

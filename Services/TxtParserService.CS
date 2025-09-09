@@ -36,7 +36,7 @@ namespace EsaLogistica.Api.Services
                            .ToList();
 
             var detPorPedido = detLines
-                .GroupBy(l => l.Substring(14, 8).Trim().PadLeft(8, '0'))
+                .GroupBy(l => l.Substring(16, 8).Trim().PadLeft(8, '0'))
                 .ToDictionary(g => g.Key, g => g.ToList());
 
             var pedidos = new List<PedidoDto>();
@@ -44,7 +44,7 @@ namespace EsaLogistica.Api.Services
             {
                 if (cabLine.Length < 50) continue;
 
-                var numPedido = cabLine.Substring(14, 8).Trim().PadLeft(8, '0');
+                var numPedido = cabLine.Substring(16, 8).Trim().PadLeft(8, '0');
                 var fechaEm = DateTime.ParseExact(cabLine.Substring(24, 8), "yyyyMMdd", CultureInfo.InvariantCulture);
                 var fechaEntRaw = cabLine.Length >= 191 ? cabLine.Substring(183, 8).Trim() : string.Empty;
                 var fechaEnt = string.IsNullOrEmpty(fechaEntRaw)

@@ -1,19 +1,24 @@
 using System;
+using System.Data;
 using System.Threading.Tasks;
 using EsaLogistica.Api.Dtos;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Data.SqlClient;
+using Dapper;
+using System.Linq;
 
 namespace EsaLogistica.Api.Services
 {
     public class ValidationService : IValidationService
     {
         private readonly ILogger<ValidationService> _logger;
-        private readonly IApiService _apiService;
+        private readonly string? _connectionString;
 
-        public ValidationService(ILogger<ValidationService> logger, IApiService apiService)
+        public ValidationService(ILogger<ValidationService> logger, IConfiguration configuration)
         {
             _logger = logger;
-            _apiService = apiService;
+            _connectionString = configuration.GetConnectionString("SaadDb");
         }
 
         public async Task ValidateCabeceraAsync(CabeceraDto cab)
@@ -75,7 +80,7 @@ namespace EsaLogistica.Api.Services
             if (!string.IsNullOrWhiteSpace(det.LoteCodigo) && det.LoteVencimiento <= DateTime.Now)
                 throw new Exception($"Lote {det.LoteCodigo} está vencido");
 
-            // Validación de stock para compañía 05
+            // Validación de stock para compañía 05 (consultando tabla local)
             if (det.ProductoCompaniaCodigo == "05")
             {
                 await ValidarStockProductoAsync(det);
@@ -162,20 +167,49 @@ namespace EsaLogistica.Api.Services
 
         private async Task ValidarStockProductoAsync(DetalleDto det)
         {
+            if (string.IsNullOrWhiteSpace(_connectionString))
+                throw new Exception("Cadena de conexión 'SaadDb' no configurada");
+
             try
             {
-                bool hayStock = await _apiService.CheckStockAsync(det.ProductoCodigo);
+                using var connection = new SqlConnection(_connectionString);
                 
-                if (!hayStock)
+                var query = @"
+                    SELECT stockDisponible 
+                    FROM [SAAD].[dbo].[_stock_disponible] 
+                    WHERE cia = @Cia AND producto = @Producto";
+
+                var stockDisponible = await connection.QuerySingleOrDefaultAsync<decimal?>(
+                    query, 
+                    new { 
+                        Cia = det.ProductoCompaniaCodigo, 
+                        Producto = det.ProductoCodigo 
+                    });
+
+                if (!stockDisponible.HasValue)
                 {
-                    throw new Exception($"Sin stock disponible para producto {det.ProductoCodigo} (Compañía 05)");
+                    throw new Exception($"Producto {det.ProductoCodigo} no encontrado en inventario para compañía {det.ProductoCompaniaCodigo}");
                 }
 
-                _logger.LogDebug("Stock validado para producto {Producto}", det.ProductoCodigo);
+                if (stockDisponible.Value < det.Cantidad)
+                {
+                    throw new Exception($"Stock insuficiente para producto {det.ProductoCodigo}: " +
+                        $"Disponible: {stockDisponible.Value}, Solicitado: {det.Cantidad}");
+                }
+
+                if (stockDisponible.Value <= 0)
+                {
+                    throw new Exception($"Sin stock disponible para producto {det.ProductoCodigo} (Compañía {det.ProductoCompaniaCodigo})");
+                }
+
+                _logger.LogDebug("Stock validado para producto {Producto}: Disponible {Stock}, Solicitado {Cantidad}", 
+                    det.ProductoCodigo, stockDisponible.Value, det.Cantidad);
             }
-            catch (Exception ex) when (!(ex.Message.Contains("Sin stock")))
+            catch (Exception ex) when (!(ex.Message.Contains("Stock insuficiente") || 
+                                       ex.Message.Contains("Sin stock") || 
+                                       ex.Message.Contains("no encontrado")))
             {
-                _logger.LogWarning("Error verificando stock para producto {Producto}: {Error}", 
+                _logger.LogWarning("Error consultando stock para producto {Producto}: {Error}", 
                     det.ProductoCodigo, ex.Message);
                 throw new Exception($"Error validando stock para producto {det.ProductoCodigo}: {ex.Message}");
             }
@@ -268,24 +302,60 @@ namespace EsaLogistica.Api.Services
             if (detalle.cantidad <= 0)
                 throw new Exception($"Detalle línea {detalle.linea}: Cantidad debe ser mayor a cero");
 
-            // Validar stock para compañía 05
+            // Validar stock para compañía 05 consultando tabla local
             if (detalle.productoCompaniaCodigo == "05")
             {
-                try
+                await ValidarStockProductoTxtAsync(detalle);
+            }
+        }
+
+        private async Task ValidarStockProductoTxtAsync(PedidoDetalleDto detalle)
+        {
+            if (string.IsNullOrWhiteSpace(_connectionString))
+                throw new Exception("Cadena de conexión 'SaadDb' no configurada");
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                
+                var query = @"
+                    SELECT stockDisponible 
+                    FROM [SAAD].[dbo].[_stock_disponible] 
+                    WHERE cia = @Cia AND producto = @Producto";
+
+                var stockDisponible = await connection.QuerySingleOrDefaultAsync<decimal?>(
+                    query, 
+                    new { 
+                        Cia = detalle.productoCompaniaCodigo, 
+                        Producto = detalle.productoCodigo 
+                    });
+
+                if (!stockDisponible.HasValue)
                 {
-                    bool hayStock = await _apiService.CheckStockAsync(detalle.productoCodigo);
-                    
-                    if (!hayStock)
-                    {
-                        throw new Exception($"Detalle línea {detalle.linea}: Sin stock disponible para producto {detalle.productoCodigo} (Compañía 05)");
-                    }
+                    throw new Exception($"Detalle línea {detalle.linea}: Producto {detalle.productoCodigo} no encontrado en inventario para compañía {detalle.productoCompaniaCodigo}");
                 }
-                catch (Exception ex) when (!(ex.Message.Contains("Sin stock")))
+
+                if (stockDisponible.Value < detalle.cantidad)
                 {
-                    _logger.LogWarning("Error verificando stock para producto {Producto} en línea {Linea}: {Error}", 
-                        detalle.productoCodigo, detalle.linea, ex.Message);
-                    throw new Exception($"Detalle línea {detalle.linea}: Error validando stock para producto {detalle.productoCodigo}: {ex.Message}");
+                    throw new Exception($"Detalle línea {detalle.linea}: Stock insuficiente para producto {detalle.productoCodigo}: " +
+                        $"Disponible: {stockDisponible.Value}, Solicitado: {detalle.cantidad}");
                 }
+
+                if (stockDisponible.Value <= 0)
+                {
+                    throw new Exception($"Detalle línea {detalle.linea}: Sin stock disponible para producto {detalle.productoCodigo} (Compañía {detalle.productoCompaniaCodigo})");
+                }
+
+                _logger.LogDebug("Stock validado para producto {Producto} línea {Linea}: Disponible {Stock}, Solicitado {Cantidad}", 
+                    detalle.productoCodigo, detalle.linea, stockDisponible.Value, detalle.cantidad);
+            }
+            catch (Exception ex) when (!(ex.Message.Contains("Stock insuficiente") || 
+                                       ex.Message.Contains("Sin stock") || 
+                                       ex.Message.Contains("no encontrado")))
+            {
+                _logger.LogWarning("Error consultando stock para producto {Producto} en línea {Linea}: {Error}", 
+                    detalle.productoCodigo, detalle.linea, ex.Message);
+                throw new Exception($"Detalle línea {detalle.linea}: Error validando stock para producto {detalle.productoCodigo}: {ex.Message}");
             }
         }
     }
