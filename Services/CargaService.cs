@@ -453,8 +453,8 @@ namespace EsaLogistica.Api.Services
                     cabecera.SubClienteCodigo,
                     cabecera.RazonSocial,
                     cabecera.DepositoCodigo,
-                    cabecera.LocalidadNombre,
                     cabecera.CodigoPostal,
+                    cabecera.LocalidadNombre, //Este es el codigo postal real 
                     cabecera.Direccion,
                     cabecera.ValorDeclarado,
                     cabecera.ReferenciaA,
