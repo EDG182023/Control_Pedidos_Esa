@@ -25,7 +25,7 @@ namespace EsaLogistica.Api.Services
             _connectionString = configuration.GetConnectionString("Servidor4");
         }
 
-        public async Task<string?> ObtenerAreaMuelleAsync(string direccion, string? subClienteCodigo, string? codigoPostal)
+        public async Task<string?> ObtenerAreaMuelleAsync(string direccion, string? subClienteCodigo, string? codigoPostal, string cliente)
         {
             if (string.IsNullOrWhiteSpace(_connectionString))
                 throw new InvalidOperationException("Cadena de conexión no configurada");
@@ -43,7 +43,7 @@ namespace EsaLogistica.Api.Services
                           WHERE Direccion = @Direccion 
                           AND SubClienteCodigo = @SubClienteCodigo
                           AND Cliente = @Cliente",
-                        new { Direccion = direccion, SubClienteCodigo = subClienteCodigo, Cliente = Cliente});
+                        new { Direccion = direccion, SubClienteCodigo = subClienteCodigo, Cliente = cliente});
 
                     if (!string.IsNullOrWhiteSpace(areaPorSubCliente))
                     {
@@ -70,7 +70,7 @@ namespace EsaLogistica.Api.Services
 
                 // 3. PRIORIDAD 3: Área por defecto
                 _logger.LogWarning("No se encontró área específica, usando área por defecto");
-                return "00001001"; // O null si prefieres error
+                return "GENERAL"; // O null si prefieres error
 
             }
             catch (Exception ex)
