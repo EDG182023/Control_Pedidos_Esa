@@ -327,7 +327,8 @@ namespace EsaLogistica.Api.Services
                         var areaMuelle = await _muelleService.ObtenerAreaMuelleAsync(
                             cabecera.Direccion ?? string.Empty, 
                             cabecera.SubClienteCodigo, 
-                            cabecera.LocalidadNombre); // Para TXT usamos localidad como CP
+                            cabecera.LocalidadNombre,
+                            cabecera.ClienteCodigo); // Para TXT usamos localidad como CP
 
                         cabecera.AreaMuelle = areaMuelle;
                         _logger.LogInformation("Área de muelle asignada para pedido TXT {Numero}: {Area}", pedido.numero, areaMuelle);
