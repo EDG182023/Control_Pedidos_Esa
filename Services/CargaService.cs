@@ -19,7 +19,7 @@ namespace EsaLogistica.Api.Services
         private readonly IValidationService _validation;
         private readonly IApiService _apiService;
         private readonly ITxtParserService _txtParser;
-        private readonly IAddressValidationService _addressValidation;
+        private readonly IMuelleService _muelleService;
         private readonly ILogger<CargaService> _logger;
         private readonly string? _connectionString;
         private readonly string? _servidor4ConnectionString;
@@ -33,14 +33,14 @@ namespace EsaLogistica.Api.Services
             IValidationService validation,
             IApiService apiService,
             ITxtParserService txtParser,
-            IAddressValidationService addressValidation,
+            IMuelleService muelleService,
             ILogger<CargaService> logger,
             IConfiguration configuration)
         {
             _validation = validation;
             _apiService = apiService;
             _txtParser = txtParser;
-            _addressValidation = addressValidation;
+            _muelleService = muelleService;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("SaadDb");
             _servidor4ConnectionString = configuration.GetConnectionString("Servidor4");
@@ -257,31 +257,22 @@ namespace EsaLogistica.Api.Services
                     // Las validaciones ya se hicieron durante la carga, pero validamos nuevamente por seguridad
                     await _validation.ValidateCabeceraAsync(cabecera);
 
-                    // Validar dirección si está configurado
-                    if (!string.IsNullOrEmpty(cabecera.Direccion))
+                    // OBTENER ÁREA DE MUELLE
+                    try
                     {
-                        try
-                        {
-                            var validacion = await _addressValidation.ValidateAsync(
-                                cabecera.Direccion,
-                                cabecera.LocalidadNombre,
-                                null, // provincia
-                                cabecera.CodigoPostal
-                            );
+                        var areaMuelle = await _muelleService.ObtenerAreaMuelleAsync(
+                            cabecera.Direccion ?? string.Empty, 
+                            cabecera.SubClienteCodigo ?? string.Empty, 
+                            cabecera.CodigoPostal,
+                            cabecera.ClienteCodigo);
 
-                            if (validacion.IsValid)
-                            {
-                                cabecera.DireccionNormalizada = validacion.NormalizedAddress;
-                                cabecera.Lat = validacion.Lat;
-                                cabecera.Lng = validacion.Lng;
-                                cabecera.ProvinciaNormalizada = validacion.Province;
-                                cabecera.LocalidadNormalizada = validacion.Locality;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning("Error validando dirección para {Numero}: {Error}", cabecera.Numero, ex.Message);
-                        }
+                        cabecera.AreaMuelle = areaMuelle;
+                        _logger.LogInformation("Área de muelle asignada para {Numero}: {Area}", cabecera.Numero, areaMuelle);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning("Error obteniendo área de muelle para {Numero}: {Error}", cabecera.Numero, ex.Message);
+                        cabecera.AreaMuelle = "GENERAL"; // Valor por defecto
                     }
 
                     // Procesar detalles asociados
@@ -296,21 +287,6 @@ namespace EsaLogistica.Api.Services
 
                     // Insertar en tablas temporales de la base de datos
                     await InsertarEnTablasTemporales(cabecera, detallesAsociados);
-
-                    // Ejecutar SP de validación adicional
-                    if (!string.IsNullOrEmpty(cabecera.Direccion) && !string.IsNullOrEmpty(cabecera.CodigoPostal))
-                    {
-                        try
-                        {
-                            await EjecutarValidarDireccionActualizarMuelleAsync(cabecera.Direccion, cabecera.CodigoPostal);
-                            _logger.LogInformation("SP ValidarDireccionActualizarMuelle ejecutado para {Numero}", cabecera.Numero);
-                        }
-                        catch (Exception spEx)
-                        {
-                            _logger.LogError(spEx, "Error ejecutando SP para {Numero}", cabecera.Numero);
-                            errores.Add($"Error ejecutando SP para {cabecera.Numero}: {spEx.Message}");
-                        }
-                    }
 
                     etapasInsertadas++;
                     procesados++;
@@ -341,9 +317,26 @@ namespace EsaLogistica.Api.Services
                     // Validar el pedido completo
                     await _validation.ValidatePedidoTxtAsync(pedido);
 
-                    // Convertir pedido TXT a formato cabecera/detalle y guardar en tablas temporales
+                    // Convertir pedido TXT a formato cabecera/detalle
                     var cabecera = ConvertirPedidoACabecera(pedido);
                     var detalles = ConvertirPedidoADetalles(pedido);
+
+                    // OBTENER ÁREA DE MUELLE para pedidos TXT
+                    try
+                    {
+                        var areaMuelle = await _muelleService.ObtenerAreaMuelleAsync(
+                            cabecera.Direccion ?? string.Empty, 
+                            cabecera.SubClienteCodigo, 
+                            cabecera.LocalidadNombre); // Para TXT usamos localidad como CP
+
+                        cabecera.AreaMuelle = areaMuelle;
+                        _logger.LogInformation("Área de muelle asignada para pedido TXT {Numero}: {Area}", pedido.numero, areaMuelle);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning("Error obteniendo área de muelle para pedido TXT {Numero}: {Error}", pedido.numero, ex.Message);
+                        cabecera.AreaMuelle = "GENERAL"; // Valor por defecto
+                    }
 
                     await InsertarEnTablasTemporales(cabecera, detalles);
                     
@@ -426,16 +419,14 @@ namespace EsaLogistica.Api.Services
                         Kilos, M3, SubClienteCodigo, RazonSocial, 
                         DepositoCodigo, LocalidadNombre, CodigoPostal, Direccion,
                         ValorDeclarado, ReferenciaA, ReferenciaB, Observaciones,
-                        Telefono, Email, AreaMuelle, DireccionNormalizada,
-                        Lat, Lng, ProvinciaNormalizada, LocalidadNormalizada
+                        Telefono, Email, AreaMuelle
                     ) VALUES (
                         @TipoCodigo, @Categoria, @Sucursal, @Numero,
                         @FechaEmision, @FechaEntrega, @ClienteCodigo, @Bultos,
                         @Kilos, @M3, @SubClienteCodigo, @RazonSocial,
                         @DepositoCodigo, @LocalidadNombre, @CodigoPostal, @Direccion,
                         @ValorDeclarado, @ReferenciaA, @ReferenciaB, @Observaciones,
-                        @Telefono, @Email, @AreaMuelle, @DireccionNormalizada,
-                        @Lat, @Lng, @ProvinciaNormalizada, @LocalidadNormalizada
+                        @Telefono, @Email, @AreaMuelle
                     )";
 
                 await connection.ExecuteAsync(insertCabeceraQuery, new
@@ -453,8 +444,8 @@ namespace EsaLogistica.Api.Services
                     cabecera.SubClienteCodigo,
                     cabecera.RazonSocial,
                     cabecera.DepositoCodigo,
+                    cabecera.LocalidadNombre, // Este es el codigo postal real en algunos casos
                     cabecera.CodigoPostal,
-                    cabecera.LocalidadNombre, //Este es el codigo postal real 
                     cabecera.Direccion,
                     cabecera.ValorDeclarado,
                     cabecera.ReferenciaA,
@@ -462,12 +453,7 @@ namespace EsaLogistica.Api.Services
                     cabecera.Observaciones,
                     cabecera.Telefono,
                     cabecera.Email,
-                    cabecera.AreaMuelle,
-                    cabecera.DireccionNormalizada,
-                    cabecera.Lat,
-                    cabecera.Lng,
-                    cabecera.ProvinciaNormalizada,
-                    cabecera.LocalidadNormalizada
+                    cabecera.AreaMuelle
                 }, transaction);
 
                 // Insertar detalles en DetalleTemp
@@ -499,8 +485,8 @@ namespace EsaLogistica.Api.Services
 
                 transaction.Commit();
                 
-                _logger.LogInformation("Insertado en tablas temporales: Cabecera {Numero} con {DetallesCount} detalles",
-                    cabecera.Numero, detalles.Count);
+                _logger.LogInformation("Insertado en tablas temporales: Cabecera {Numero} con {DetallesCount} detalles, Área: {Area}",
+                    cabecera.Numero, detalles.Count, cabecera.AreaMuelle);
             }
             catch (Exception ex)
             {
@@ -527,7 +513,8 @@ namespace EsaLogistica.Api.Services
                     numero = cabecera.Numero,
                     fecha = cabecera.FechaEmision,
                     cliente = cabecera.ClienteCodigo,
-                    direccion = cabecera.DireccionNormalizada ?? cabecera.Direccion,
+                    direccion = cabecera.Direccion,
+                    areaMuelle = cabecera.AreaMuelle,
                     items = detalles.Select(d => new
                     {
                         producto = d.ProductoCodigo,
@@ -546,107 +533,6 @@ namespace EsaLogistica.Api.Services
                 _logger.LogError(ex, "Error enviando documento {Numero} a API externa", cabecera.Numero);
                 throw;
             }
-        }
-
-        private async Task InsertarEnBaseDatos(CabeceraDto cabecera, List<DetalleDto> detalles)
-        {
-            if (string.IsNullOrWhiteSpace(_servidor4ConnectionString))
-                throw new InvalidOperationException("Cadena de conexión 'Servidor4' no configurada");
-
-            using var connection = new SqlConnection(_servidor4ConnectionString);
-            await connection.OpenAsync();
-            using var transaction = connection.BeginTransaction();
-
-            try
-            {
-                // Insertar cabecera usando SP
-                var cabeceraParams = new
-                {
-                    cabecera.TipoCodigo,
-                    cabecera.Categoria,
-                    cabecera.Sucursal,
-                    cabecera.Numero,
-                    cabecera.FechaEmision,
-                    cabecera.FechaEntrega,
-                    cabecera.ClienteCodigo,
-                    cabecera.Bultos,
-                    cabecera.Kilos,
-                    cabecera.M3,
-                    cabecera.SubClienteCodigo,
-                    cabecera.RazonSocial,
-                    cabecera.DepositoCodigo,
-                    cabecera.LocalidadNombre,
-                    cabecera.CodigoPostal,
-                    cabecera.Direccion,
-                    cabecera.ValorDeclarado,
-                    cabecera.ReferenciaA,
-                    cabecera.ReferenciaB,
-                    cabecera.Observaciones,
-                    cabecera.Telefono,
-                    cabecera.Email,
-                    cabecera.AreaMuelle,
-                    cabecera.DireccionNormalizada,
-                    cabecera.Lat,
-                    cabecera.Lng,
-                    cabecera.ProvinciaNormalizada,
-                    cabecera.LocalidadNormalizada
-                };
-
-                await connection.ExecuteAsync(
-                    "sp_ControlFleteros_InsertCabecera",
-                    cabeceraParams,
-                    transaction,
-                    commandType: CommandType.StoredProcedure);
-
-                // Insertar detalles usando SP
-                foreach (var detalle in detalles)
-                {
-                    var detalleParams = new
-                    {
-                        Numero = cabecera.Numero,
-                        detalle.Linea,
-                        detalle.ProductoCodigo,
-                        detalle.ProductoCompaniaCodigo,
-                        detalle.LoteCodigo,
-                        detalle.LoteVencimiento,
-                        detalle.Serie,
-                        detalle.Cantidad
-                    };
-
-                    await connection.ExecuteAsync(
-                        "sp_ControlFleteros_InsertDetalle",
-                        detalleParams,
-                        transaction,
-                        commandType: CommandType.StoredProcedure);
-                }
-
-                transaction.Commit();
-                _logger.LogInformation(
-                    "Insertado en ControlFleteros: Cabecera {Numero} con {DetallesCount} detalles",
-                    cabecera.Numero, detalles.Count);
-            }
-            catch (Exception ex)
-            {
-                transaction.Rollback();
-                _logger.LogError(ex, "Error insertando cabecera {Numero} en ControlFleteros", cabecera.Numero);
-                throw;
-            }
-        }
-
-        private async Task EjecutarValidarDireccionActualizarMuelleAsync(string direccion, string? codigoPostal)
-        {
-            if (string.IsNullOrWhiteSpace(_connectionString))
-                throw new InvalidOperationException("Cadena de conexión no configurada");
-
-            using var connection = new SqlConnection(_connectionString);
-            var parameters = new DynamicParameters();
-            parameters.Add("@Direccion", direccion);
-            parameters.Add("@CodigoPostal", codigoPostal);
-            
-            await connection.ExecuteAsync(
-                "ValidarDireccionActualizarMuelle",
-                parameters,
-                commandType: CommandType.StoredProcedure);
         }
 
         private async Task GuardarPedidoLocalmente(PedidoDto pedido)

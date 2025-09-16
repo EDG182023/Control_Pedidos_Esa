@@ -20,33 +20,11 @@ builder.Services.AddHttpClient<IApiService, ApiService>(c =>
 // ValidationService depende de IApiService
 builder.Services.AddScoped<IValidationService, ValidationService>();
 
-// CargaService depende de ValidationService
+// NUEVO: MuelleService para gestión de áreas de muelle
+builder.Services.AddScoped<IMuelleService, MuelleService>();
+
+// CargaService depende de ValidationService y MuelleService
 builder.Services.AddScoped<ICargaService, CargaService>();
-
-// HttpClients tipados para validación de direcciones
-builder.Services.AddHttpClient<GeorefArAddressValidationService>(c =>
-{
-    c.BaseAddress = new Uri(builder.Configuration["AddressValidation:Georef:BaseUrl"]!);
-    c.Timeout = TimeSpan.FromSeconds(builder.Configuration.GetValue<int>("AddressValidation:Georef:TimeoutSeconds", 5));
-});
-
-builder.Services.AddHttpClient<NominatimAddressValidationService>(c =>
-{
-    c.BaseAddress = new Uri(builder.Configuration["AddressValidation:Nominatim:BaseUrl"]!);
-    c.Timeout = TimeSpan.FromSeconds(builder.Configuration.GetValue<int>("AddressValidation:Nominatim:TimeoutSeconds", 5));
-    c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "EsaLogistica/1.0 (+validacion-direccion)");
-});
-
-builder.Services.AddScoped<IAddressValidationService>(sp =>
-{
-    var cfg = sp.GetRequiredService<IConfiguration>();
-    var prov = cfg["AddressValidation:Provider"]?.ToLowerInvariant();
-    return prov switch
-    {
-        "nominatim" => sp.GetRequiredService<NominatimAddressValidationService>(),
-        _ => sp.GetRequiredService<GeorefArAddressValidationService>()
-    };
-});
 
 // CORS
 builder.Services.AddCors(options =>
