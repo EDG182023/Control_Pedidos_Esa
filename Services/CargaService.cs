@@ -24,10 +24,10 @@ namespace EsaLogistica.Api.Services
         private readonly string? _connectionString;
         private readonly string? _servidor4ConnectionString;
 
-        // Almacenamiento temporal en memoria (en producción usar BD)
-        private static readonly List<CabeceraDto> _cabecerasTemp = new();
-        private static readonly List<DetalleDto> _detallesTemp = new();
-        private static readonly List<PedidoDto> _pedidosTemp = new();
+        // Variables de instancia (no estáticas)
+        private readonly List<CabeceraDto> _cabecerasTemp = new();
+        private readonly List<DetalleDto> _detallesTemp = new();
+        private readonly List<PedidoDto> _pedidosTemp = new();
 
         public CargaService(
             IValidationService validation,
@@ -54,32 +54,33 @@ namespace EsaLogistica.Api.Services
             // Limpiar datos temporales
             _cabecerasTemp.Clear();
             _detallesTemp.Clear();
+            _pedidosTemp.Clear();
+
+            _logger.LogInformation("Iniciando carga Excel - Estado limpio");
 
             ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
 
             using var stream = new MemoryStream();
             await file.CopyToAsync(stream);
-            
+
             using var package = new ExcelPackage(stream);
-            
-            // Procesar hoja de cabeceras
-            var cabeceraSheet = package.Workbook.Worksheets.FirstOrDefault(w => 
+
+            var cabeceraSheet = package.Workbook.Worksheets.FirstOrDefault(w =>
                 w.Name.Contains("Cabecera", StringComparison.OrdinalIgnoreCase) ||
-                w.Name.Contains("Header", StringComparison.OrdinalIgnoreCase)) ?? 
+                w.Name.Contains("Header", StringComparison.OrdinalIgnoreCase)) ??
                 package.Workbook.Worksheets.First();
 
             await ProcesarCabecerasExcel(cabeceraSheet);
 
-            // Procesar hoja de detalles
-            var detalleSheet = package.Workbook.Worksheets.FirstOrDefault(w => 
+            var detalleSheet = package.Workbook.Worksheets.FirstOrDefault(w =>
                 w.Name.Contains("Detalle", StringComparison.OrdinalIgnoreCase) ||
-                w.Name.Contains("Detail", StringComparison.OrdinalIgnoreCase)) ?? 
+                w.Name.Contains("Detail", StringComparison.OrdinalIgnoreCase)) ??
                 package.Workbook.Worksheets.Skip(1).FirstOrDefault();
 
             if (detalleSheet != null)
                 await ProcesarDetallesExcel(detalleSheet);
 
-            _logger.LogInformation("Excel cargado: {CabecerasCount} cabeceras, {DetallesCount} detalles", 
+            _logger.LogInformation("Excel cargado: {CabecerasCount} cabeceras, {DetallesCount} detalles",
                 _cabecerasTemp.Count, _detallesTemp.Count);
         }
 
@@ -89,7 +90,11 @@ namespace EsaLogistica.Api.Services
                 throw new ArgumentException("Archivos TXT nulos");
 
             // Limpiar datos temporales
+            _cabecerasTemp.Clear();
+            _detallesTemp.Clear();
             _pedidosTemp.Clear();
+
+            _logger.LogInformation("Iniciando carga TXT - Estado limpio");
 
             using var cabeceraStream = cabecera.OpenReadStream();
             using var detalleStream = detalle.OpenReadStream();
@@ -106,44 +111,347 @@ namespace EsaLogistica.Api.Services
             int procesados = 0;
             int etapasInsertadas = 0;
 
+            _logger.LogInformation("Iniciando procesamiento optimizado - Excel: {ExcelCount}, TXT: {TxtCount}",
+                _cabecerasTemp.Count, _pedidosTemp.Count);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
             try
             {
+                // OPTIMIZACIÓN: Pre-validar en lote si hay datos TXT
+                if (_pedidosTemp.Any())
+                {
+                    _logger.LogInformation("Pre-cargando cache de validación para {Count} pedidos TXT", _pedidosTemp.Count);
+                    var cacheStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+                    // Cast necesario para el método optimizado
+                    var validationService = _validation as ValidationService;
+                    if (validationService != null)
+                    {
+                        await validationService.ValidarLoteAsync(_pedidosTemp);
+                        _logger.LogInformation("Cache precargado en {CacheMs}ms", cacheStopwatch.ElapsedMilliseconds);
+                    }
+                }
+
                 // Procesar datos de Excel
                 if (_cabecerasTemp.Any())
                 {
+                    _logger.LogInformation("Procesando {Count} cabeceras de Excel", _cabecerasTemp.Count);
                     var resultado = await ProcesarExcelDataAsync();
                     procesados += resultado.procesados;
                     etapasInsertadas += resultado.etapasInsertadas;
                     errores.AddRange(resultado.errores);
                 }
 
-                // Procesar datos de TXT
+                // Procesar datos de TXT (con validación optimizada)
                 if (_pedidosTemp.Any())
                 {
-                    var resultado = await ProcesarTxtDataAsync();
+                    _logger.LogInformation("Procesando {Count} pedidos de TXT con cache", _pedidosTemp.Count);
+                    var resultado = await ProcesarTxtDataOptimizadoAsync();
                     procesados += resultado.procesados;
                     etapasInsertadas += resultado.etapasInsertadas;
                     errores.AddRange(resultado.errores);
                 }
 
-                _logger.LogInformation("Procesamiento completado: {Procesados} procesados, {Insertadas} insertadas", 
-                    procesados, etapasInsertadas);
+                if (!_cabecerasTemp.Any() && !_pedidosTemp.Any())
+                {
+                    errores.Add("No se encontraron datos para procesar. Verifique que el archivo sea válido.");
+                }
+
+                stopwatch.Stop();
+                _logger.LogInformation("Procesamiento completado en {TotalMs}ms: {Procesados} procesados, {Insertadas} insertadas, {ErroresCount} errores",
+                    stopwatch.ElapsedMilliseconds, procesados, etapasInsertadas, errores.Count);
 
                 return (procesados, etapasInsertadas, errores);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error general en procesamiento");
+                stopwatch.Stop();
+                _logger.LogError(ex, "Error general en procesamiento después de {Ms}ms", stopwatch.ElapsedMilliseconds);
                 errores.Add($"Error general en procesamiento: {ex.Message}");
                 return (procesados, etapasInsertadas, errores);
             }
         }
 
+        // NUEVO: Método optimizado para TXT con cache
+        private async Task<(int procesados, int etapasInsertadas, List<string> errores)> ProcesarTxtDataOptimizadoAsync()
+        {
+            var errores = new List<string>();
+            int procesados = 0;
+            int etapasInsertadas = 0;
+
+            // Pre-obtener áreas de muelle en lote
+            var areasCache = new Dictionary<string, string>();
+            await PrecargarAreasMuelle(areasCache);
+
+            // OPTIMIZACIÓN: Preparar datos para bulk insert
+            var cabecerasParaInsertar = new List<CabeceraDto>();
+            var detallesParaInsertar = new List<(CabeceraDto cabecera, List<DetalleDto> detalles)>();
+
+            foreach (var pedido in _pedidosTemp)
+            {
+                try
+                {
+                    // Validación rápida con cache
+                    await _validation.ValidatePedidoTxtAsync(pedido);
+
+                    // Convertir pedido TXT a formato cabecera/detalle
+                    var cabecera = ConvertirPedidoACabecera(pedido);
+                    var detalles = ConvertirPedidoADetalles(pedido);
+
+                    // Asignar área de muelle desde cache
+                    var cacheKey = $"{cabecera.Direccion}|{cabecera.SubClienteCodigo}|{cabecera.LocalidadNombre}|{cabecera.ClienteCodigo}";
+                    cabecera.AreaMuelle = areasCache.GetValueOrDefault(cacheKey, "GENERAL");
+
+                    cabecerasParaInsertar.Add(cabecera);
+                    detallesParaInsertar.Add((cabecera, detalles));
+
+                    procesados++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Error validando pedido TXT {Numero}: {Error}", pedido.numero, ex.Message);
+                    errores.Add($"Error procesando pedido TXT {pedido.numero}: {ex.Message}");
+                }
+            }
+
+            // BULK INSERT optimizado
+            if (cabecerasParaInsertar.Any())
+            {
+                etapasInsertadas = await BulkInsertCabecerasDetallesAsync(detallesParaInsertar);
+            }
+
+            return (procesados, etapasInsertadas, errores);
+        }
+
+        private async Task PrecargarAreasMuelle(Dictionary<string, string> cache)
+        {
+            // Extraer combinaciones únicas de criterios de área de muelle
+            var criterios = _pedidosTemp.Select(p => new
+            {
+                Direccion = ConvertirPedidoACabecera(p).Direccion,
+                SubClienteCodigo = ConvertirPedidoACabecera(p).SubClienteCodigo,
+                LocalidadNombre = ConvertirPedidoACabecera(p).LocalidadNombre,
+                ClienteCodigo = ConvertirPedidoACabecera(p).ClienteCodigo
+            }).Distinct().ToList();
+
+            foreach (var criterio in criterios)
+            {
+                try
+                {
+                    var area = await _muelleService.ObtenerAreaMuelleAsync(
+                        criterio.Direccion ?? string.Empty,
+                        criterio.SubClienteCodigo,
+                        criterio.LocalidadNombre,
+                        criterio.ClienteCodigo);
+
+                    var cacheKey = $"{criterio.Direccion}|{criterio.SubClienteCodigo}|{criterio.LocalidadNombre}|{criterio.ClienteCodigo}";
+                    cache[cacheKey] = area ?? "GENERAL";
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Error obteniendo área muelle: {Error}", ex.Message);
+                    var cacheKey = $"{criterio.Direccion}|{criterio.SubClienteCodigo}|{criterio.LocalidadNombre}|{criterio.ClienteCodigo}";
+                    cache[cacheKey] = "GENERAL";
+                }
+            }
+
+            _logger.LogInformation("Cache de áreas de muelle precargado: {Count} entradas", cache.Count);
+        }
+
+        // OPTIMIZACIÓN: Bulk insert con helper para no superar 2100 parámetros
+        private async Task<int> BulkInsertCabecerasDetallesAsync(List<(CabeceraDto cabecera, List<DetalleDto> detalles)> datos)
+        {
+            if (string.IsNullOrWhiteSpace(_servidor4ConnectionString))
+                throw new InvalidOperationException("Cadena de conexión 'Servidor4' no configurada");
+
+            using var connection = new SqlConnection(_servidor4ConnectionString);
+            await connection.OpenAsync();
+            using var transaction = connection.BeginTransaction();
+
+            try
+            {
+                int totalCabecerasInsertadas = 0;
+
+                // === 1) INSERT CABECERAS EN LOTES SEGUROS ===
+                // Cada fila de Cabecera inserta 23 columnas -> 23 parámetros por fila
+                const int CabeceraParamsPorFila = 23;
+                int cabeceraBatchSize = SqlBatchHelper.CalcBatchSize(CabeceraParamsPorFila, safetyMargin: 200);
+
+                foreach (var loteCab in SqlBatchHelper.ChunkBy(datos, cabeceraBatchSize))
+                {
+                    var insertCabQueryHead = @"
+                        INSERT INTO dbo.CabeceraTemp (
+                            TipoCodigo, Categoria, Sucursal, Numero, 
+                            FechaEmision, FechaEntrega, ClienteCodigo, Bultos, 
+                            Kilos, M3, SubClienteCodigo, RazonSocial, 
+                            DepositoCodigo, LocalidadNombre, CodigoPostal, Direccion,
+                            ValorDeclarado, ReferenciaA, ReferenciaB, Observaciones,
+                            Telefono, Email, AreaMuelle
+                        ) VALUES ";
+
+                    var values = new List<string>();
+                    var dp = new DynamicParameters();
+
+                    for (int i = 0; i < loteCab.Count; i++)
+                    {
+                        var (cab, _) = loteCab[i];
+
+                        string idx = i.ToString();
+                        values.Add($"(@tc{idx}, @cat{idx}, @suc{idx}, @num{idx}, @fe{idx}, @fent{idx}, @cli{idx}, @bul{idx}, @kil{idx}, @m3{idx}, @sub{idx}, @rs{idx}, @dep{idx}, @loc{idx}, @cp{idx}, @dir{idx}, @vd{idx}, @ra{idx}, @rb{idx}, @obs{idx}, @tel{idx}, @mail{idx}, @area{idx})");
+
+                        SqlBatchHelper.Add(dp, $"@tc{idx}", cab.TipoCodigo);
+                        SqlBatchHelper.Add(dp, $"@cat{idx}", cab.Categoria);
+                        SqlBatchHelper.Add(dp, $"@suc{idx}", cab.Sucursal);
+                        SqlBatchHelper.Add(dp, $"@num{idx}", cab.Numero);
+                        SqlBatchHelper.Add(dp, $"@fe{idx}", cab.FechaEmision);
+                        SqlBatchHelper.Add(dp, $"@fent{idx}", cab.FechaEntrega);
+                        SqlBatchHelper.Add(dp, $"@cli{idx}", cab.ClienteCodigo);
+                        SqlBatchHelper.Add(dp, $"@bul{idx}", cab.Bultos);
+                        SqlBatchHelper.Add(dp, $"@kil{idx}", cab.Kilos);
+                        SqlBatchHelper.Add(dp, $"@m3{idx}", cab.M3);
+                        SqlBatchHelper.Add(dp, $"@sub{idx}", cab.SubClienteCodigo);
+                        SqlBatchHelper.Add(dp, $"@rs{idx}", cab.RazonSocial);
+                        SqlBatchHelper.Add(dp, $"@dep{idx}", cab.DepositoCodigo);
+                        SqlBatchHelper.Add(dp, $"@loc{idx}", cab.LocalidadNombre);
+                        SqlBatchHelper.Add(dp, $"@cp{idx}", cab.CodigoPostal);
+                        SqlBatchHelper.Add(dp, $"@dir{idx}", cab.Direccion);
+                        SqlBatchHelper.Add(dp, $"@vd{idx}", cab.ValorDeclarado);
+                        SqlBatchHelper.Add(dp, $"@ra{idx}", cab.ReferenciaA);
+                        SqlBatchHelper.Add(dp, $"@rb{idx}", cab.ReferenciaB);
+                        SqlBatchHelper.Add(dp, $"@obs{idx}", cab.Observaciones);
+                        SqlBatchHelper.Add(dp, $"@tel{idx}", cab.Telefono);
+                        SqlBatchHelper.Add(dp, $"@mail{idx}", cab.Email);
+                        SqlBatchHelper.Add(dp, $"@area{idx}", cab.AreaMuelle);
+                    }
+
+                    var sql = insertCabQueryHead + string.Join(",", values);
+                    await connection.ExecuteAsync(sql, dp, transaction);
+                    totalCabecerasInsertadas += loteCab.Count;
+
+                    // === 2) INSERT DETALLES PARA ESTE LOTE, TAMBIÉN EN LOTES SEGUROS ===
+                    // Cada fila de Detalle pasa 9 parámetros (Numero, Linea, ProductoCodigo, ProductoCompaniaCodigo, LoteCodigo, LoteVencimiento, Serie, Cantidad, DespachoParcial)
+                    const int DetalleParamsPorFila = 9;
+                    int detalleBatchSize = SqlBatchHelper.CalcBatchSize(DetalleParamsPorFila, safetyMargin: 200);
+
+                    var detallesDelLote = new List<(string Numero, DetalleDto Detalle)>();
+                    foreach (var (cab, dets) in loteCab)
+                    {
+                        foreach (var d in dets)
+                            detallesDelLote.Add((cab.Numero!, d));
+                    }
+
+                    foreach (var loteDet in SqlBatchHelper.ChunkBy(detallesDelLote, detalleBatchSize))
+                    {
+                        var valuesDet = new List<string>();
+                        var dpDet = new DynamicParameters();
+
+                        for (int j = 0; j < loteDet.Count; j++)
+                        {
+                            var item = loteDet[j];
+                            string idx = j.ToString();
+
+                            valuesDet.Add($"(@num{idx}, @lin{idx}, @prod{idx}, @comp{idx}, @lote{idx}, @venc{idx}, @serie{idx}, @cant{idx}, @desp{idx})");
+
+                            SqlBatchHelper.Add(dpDet, $"@num{idx}", item.Numero);
+                            SqlBatchHelper.Add(dpDet, $"@lin{idx}", item.Detalle.Linea);
+                            SqlBatchHelper.Add(dpDet, $"@prod{idx}", item.Detalle.ProductoCodigo);
+                            SqlBatchHelper.Add(dpDet, $"@comp{idx}", item.Detalle.ProductoCompaniaCodigo);
+                            SqlBatchHelper.Add(dpDet, $"@lote{idx}", item.Detalle.LoteCodigo);
+                            SqlBatchHelper.Add(dpDet, $"@venc{idx}", item.Detalle.LoteVencimiento);
+                            SqlBatchHelper.Add(dpDet, $"@serie{idx}", item.Detalle.Serie);
+                            SqlBatchHelper.Add(dpDet, $"@cant{idx}", item.Detalle.Cantidad);
+                            SqlBatchHelper.Add(dpDet, $"@desp{idx}", false);
+                        }
+
+                        if (valuesDet.Any())
+                        {
+                            var insertDetSql = @"
+                                INSERT INTO dbo.DetalleTemp (
+                                    IdCabecera, Linea, ProductoCodigo, ProductoCompaniaCodigo,
+                                    LoteCodigo, LoteVencimiento, Serie, Cantidad, DespachoParcial
+                                ) 
+                                SELECT ct.IdCabecera, d.Linea, d.ProductoCodigo, d.ProductoCompaniaCodigo,
+                                       d.LoteCodigo, d.LoteVencimiento, d.Serie, d.Cantidad, d.DespachoParcial
+                                FROM (VALUES " + string.Join(",", valuesDet) + @") AS d(Numero, Linea, ProductoCodigo, ProductoCompaniaCodigo, LoteCodigo, LoteVencimiento, Serie, Cantidad, DespachoParcial)
+                                INNER JOIN dbo.CabeceraTemp ct ON ct.Numero = d.Numero";
+
+                            await connection.ExecuteAsync(insertDetSql, dpDet, transaction);
+                        }
+                    }
+                }
+
+                transaction.Commit();
+
+                _logger.LogInformation("Bulk insert completado: {Insertadas} cabeceras con sus detalles (en lotes seguros)", totalCabecerasInsertadas);
+                return totalCabecerasInsertadas;
+            }
+            catch (Exception ex)
+            {
+                transaction.Rollback();
+                _logger.LogError(ex, "Error en bulk insert");
+                throw;
+            }
+        }
+
+        // Métodos originales sin cambios (para Excel)
+        private async Task<(int procesados, int etapasInsertadas, List<string> errores)> ProcesarExcelDataAsync()
+        {
+            var errores = new List<string>();
+            int procesados = 0;
+            int etapasInsertadas = 0;
+
+            foreach (var cabecera in _cabecerasTemp)
+            {
+                try
+                {
+                    await _validation.ValidateCabeceraAsync(cabecera);
+
+                    // Obtener área de muelle
+                    try
+                    {
+                        var areaMuelle = await _muelleService.ObtenerAreaMuelleAsync(
+                            cabecera.Direccion ?? string.Empty,
+                            cabecera.SubClienteCodigo ?? string.Empty,
+                            cabecera.CodigoPostal,
+                            cabecera.ClienteCodigo);
+
+                        cabecera.AreaMuelle = areaMuelle;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning("Error obteniendo área de muelle para {Numero}: {Error}", cabecera.Numero, ex.Message);
+                        cabecera.AreaMuelle = "GENERAL";
+                    }
+
+                    var detallesAsociados = _detallesTemp.Where(d => d.Numero == cabecera.Numero).ToList();
+
+                    if (!detallesAsociados.Any())
+                    {
+                        errores.Add($"No se encontraron detalles para cabecera {cabecera.Numero}");
+                        continue;
+                    }
+
+                    await InsertarEnTablasTemporales(cabecera, detallesAsociados);
+                    etapasInsertadas++;
+                    procesados++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error procesando cabecera {Numero}", cabecera.Numero);
+                    errores.Add($"Error procesando cabecera {cabecera.Numero}: {ex.Message}");
+                }
+            }
+
+            return (procesados, etapasInsertadas, errores);
+        }
+
+        // Métodos auxiliares sin cambios
         private async Task ProcesarCabecerasExcel(ExcelWorksheet sheet)
         {
             var rowCount = sheet.Dimension?.Rows ?? 0;
-            
-            for (int row = 2; row <= rowCount; row++) // Asumiendo fila 1 son headers
+
+            for (int row = 2; row <= rowCount; row++)
             {
                 try
                 {
@@ -173,17 +481,14 @@ namespace EsaLogistica.Api.Services
                         Email = string.IsNullOrWhiteSpace(sheet.Cells[row, 22].Text) ? null : sheet.Cells[row, 22].Text.Trim()
                     };
 
-                    // Validar la cabecera antes de agregarla
                     try
                     {
                         await _validation.ValidateCabeceraAsync(cabecera);
                         _cabecerasTemp.Add(cabecera);
-                        _logger.LogDebug("Cabecera {Numero} agregada correctamente", cabecera.Numero);
                     }
                     catch (Exception validationEx)
                     {
                         _logger.LogWarning("Error validando cabecera fila {Row}: {Error}", row, validationEx.Message);
-                        // Continuamos con la siguiente fila en lugar de fallar completamente
                         continue;
                     }
                 }
@@ -214,24 +519,20 @@ namespace EsaLogistica.Api.Services
                         Cantidad = int.TryParse(sheet.Cells[row, 8].Text, out var c) ? c : 0
                     };
 
-                    // Validar que el detalle corresponda a una cabecera existente
                     if (!_cabecerasTemp.Any(cab => cab.Numero == detalle.Numero))
                     {
                         _logger.LogWarning("Detalle fila {Row}: No se encontró cabecera para número {Numero}", row, detalle.Numero);
                         continue;
                     }
 
-                    // Validar el detalle antes de agregarlo
                     try
                     {
                         await _validation.ValidateDetalleAsync(detalle);
                         _detallesTemp.Add(detalle);
-                        _logger.LogDebug("Detalle {Numero}-{Linea} agregado correctamente", detalle.Numero, detalle.Linea);
                     }
                     catch (Exception validationEx)
                     {
                         _logger.LogWarning("Error validando detalle fila {Row}: {Error}", row, validationEx.Message);
-                        // Continuamos con la siguiente fila
                         continue;
                     }
                 }
@@ -240,120 +541,6 @@ namespace EsaLogistica.Api.Services
                     _logger.LogWarning("Error procesando detalle fila {Row}: {Error}", row, ex.Message);
                 }
             }
-
-            await Task.CompletedTask; // Para evitar el warning CS1998
-        }
-
-        private async Task<(int procesados, int etapasInsertadas, List<string> errores)> ProcesarExcelDataAsync()
-        {
-            var errores = new List<string>();
-            int procesados = 0;
-            int etapasInsertadas = 0;
-
-            foreach (var cabecera in _cabecerasTemp)
-            {
-                try
-                {
-                    // Las validaciones ya se hicieron durante la carga, pero validamos nuevamente por seguridad
-                    await _validation.ValidateCabeceraAsync(cabecera);
-
-                    // OBTENER ÁREA DE MUELLE
-                    try
-                    {
-                        var areaMuelle = await _muelleService.ObtenerAreaMuelleAsync(
-                            cabecera.Direccion ?? string.Empty, 
-                            cabecera.SubClienteCodigo ?? string.Empty, 
-                            cabecera.CodigoPostal,
-                            cabecera.ClienteCodigo);
-
-                        cabecera.AreaMuelle = areaMuelle;
-                        _logger.LogInformation("Área de muelle asignada para {Numero}: {Area}", cabecera.Numero, areaMuelle);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Error obteniendo área de muelle para {Numero}: {Error}", cabecera.Numero, ex.Message);
-                        cabecera.AreaMuelle = "GENERAL"; // Valor por defecto
-                    }
-
-                    // Procesar detalles asociados
-                    var detallesAsociados = _detallesTemp.Where(d => d.Numero == cabecera.Numero).ToList();
-                    
-                    if (!detallesAsociados.Any())
-                    {
-                        _logger.LogWarning("No se encontraron detalles para cabecera {Numero}", cabecera.Numero);
-                        errores.Add($"No se encontraron detalles para cabecera {cabecera.Numero}");
-                        continue;
-                    }
-
-                    // Insertar en tablas temporales de la base de datos
-                    await InsertarEnTablasTemporales(cabecera, detallesAsociados);
-
-                    etapasInsertadas++;
-                    procesados++;
-                    
-                    _logger.LogInformation("Cabecera {Numero} procesada exitosamente con {DetallesCount} detalles", 
-                        cabecera.Numero, detallesAsociados.Count);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error procesando cabecera {Numero}", cabecera.Numero);
-                    errores.Add($"Error procesando cabecera {cabecera.Numero}: {ex.Message}");
-                }
-            }
-
-            return (procesados, etapasInsertadas, errores);
-        }
-
-        private async Task<(int procesados, int etapasInsertadas, List<string> errores)> ProcesarTxtDataAsync()
-        {
-            var errores = new List<string>();
-            int procesados = 0;
-            int etapasInsertadas = 0;
-
-            foreach (var pedido in _pedidosTemp)
-            {
-                try
-                {
-                    // Validar el pedido completo
-                    await _validation.ValidatePedidoTxtAsync(pedido);
-
-                    // Convertir pedido TXT a formato cabecera/detalle
-                    var cabecera = ConvertirPedidoACabecera(pedido);
-                    var detalles = ConvertirPedidoADetalles(pedido);
-
-                    // OBTENER ÁREA DE MUELLE para pedidos TXT
-                    try
-                    {
-                        var areaMuelle = await _muelleService.ObtenerAreaMuelleAsync(
-                            cabecera.Direccion ?? string.Empty, 
-                            cabecera.SubClienteCodigo, 
-                            cabecera.LocalidadNombre,
-                            cabecera.ClienteCodigo); // Para TXT usamos localidad como CP
-
-                        cabecera.AreaMuelle = areaMuelle;
-                        _logger.LogInformation("Área de muelle asignada para pedido TXT {Numero}: {Area}", pedido.numero, areaMuelle);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Error obteniendo área de muelle para pedido TXT {Numero}: {Error}", pedido.numero, ex.Message);
-                        cabecera.AreaMuelle = "GENERAL"; // Valor por defecto
-                    }
-
-                    await InsertarEnTablasTemporales(cabecera, detalles);
-                    
-                    etapasInsertadas++;
-                    procesados++;
-
-                    _logger.LogInformation("Pedido TXT {Numero} procesado exitosamente", pedido.numero);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error procesando pedido TXT {Numero}: {Error}", pedido.numero, ex.Message);
-                    errores.Add($"Error procesando pedido TXT {pedido.numero}: {ex.Message}");
-                }
-            }
-
-            return (procesados, etapasInsertadas, errores);
         }
 
         private CabeceraDto ConvertirPedidoACabecera(PedidoDto pedido)
@@ -370,13 +557,12 @@ namespace EsaLogistica.Api.Services
                 SubClienteCodigo = pedido.subClienteCodigo,
                 RazonSocial = pedido.razonSocial,
                 Direccion = pedido.domicilio,
-                LocalidadNombre = pedido.localidadCodigo, // En TXT viene como código
-                CodigoPostal = "", // No disponible en formato TXT actual
+                LocalidadNombre = pedido.localidadCodigo,
+                CodigoPostal = "",
                 ValorDeclarado = pedido.importeFactura,
                 ReferenciaA = pedido.referenciaA,
                 ReferenciaB = pedido.referenciaB,
                 Observaciones = pedido.observaciones,
-                // Campos específicos de logística no disponibles en TXT
                 Bultos = null,
                 Kilos = null,
                 M3 = null,
@@ -395,7 +581,7 @@ namespace EsaLogistica.Api.Services
                 ProductoCodigo = d.productoCodigo,
                 ProductoCompaniaCodigo = d.productoCompaniaCodigo,
                 LoteCodigo = string.IsNullOrWhiteSpace(d.loteCodigo) ? null : d.loteCodigo,
-                LoteVencimiento = DateTime.Now.AddYears(1), // Valor por defecto
+                LoteVencimiento = DateTime.Now.AddYears(1),
                 Serie = string.IsNullOrWhiteSpace(d.serie) ? null : d.serie,
                 Cantidad = d.cantidad
             }).ToList();
@@ -412,7 +598,6 @@ namespace EsaLogistica.Api.Services
 
             try
             {
-                // Insertar en CabeceraTemp
                 var insertCabeceraQuery = @"
                     INSERT INTO dbo.CabeceraTemp (
                         TipoCodigo, Categoria, Sucursal, Numero, 
@@ -445,7 +630,7 @@ namespace EsaLogistica.Api.Services
                     cabecera.SubClienteCodigo,
                     cabecera.RazonSocial,
                     cabecera.DepositoCodigo,
-                    cabecera.LocalidadNombre, // Este es el codigo postal real en algunos casos
+                    cabecera.LocalidadNombre,
                     cabecera.CodigoPostal,
                     cabecera.Direccion,
                     cabecera.ValorDeclarado,
@@ -457,7 +642,6 @@ namespace EsaLogistica.Api.Services
                     cabecera.AreaMuelle
                 }, transaction);
 
-                // Insertar detalles en DetalleTemp
                 var insertDetalleQuery = @"
                     INSERT INTO dbo.DetalleTemp (
                         IdCabecera, Linea, ProductoCodigo, ProductoCompaniaCodigo,
@@ -480,71 +664,58 @@ namespace EsaLogistica.Api.Services
                         detalle.LoteVencimiento,
                         detalle.Serie,
                         detalle.Cantidad,
-                        DespachoParcial = false // Valor por defecto
+                        DespachoParcial = false
                     }, transaction);
                 }
 
                 transaction.Commit();
-                
-                _logger.LogInformation("Insertado en tablas temporales: Cabecera {Numero} con {DetallesCount} detalles, Área: {Area}",
-                    cabecera.Numero, detalles.Count, cabecera.AreaMuelle);
             }
             catch (Exception ex)
             {
                 transaction.Rollback();
-                _logger.LogError(ex, "Error insertando en tablas temporales para cabecera {Numero}", cabecera.Numero);
+                _logger.LogError(ex, "Error en InsertarEnTablasTemporales");
                 throw;
             }
         }
 
-        private bool EsDocumentoParaApiExterna(string tipoCodigo)
+        // ===== Helper interno para lotes y nulabilidad =====
+       // ===== Helper interno para lotes y nulabilidad (FIX) =====
+    private static class SqlBatchHelper
+    {
+        public const int MaxParams = 2100;
+
+        public static int CalcBatchSize(int paramsPerRow, int safetyMargin = 200)
         {
-            // Define aquí qué tipos de código van a la API externa
-            var tiposApiExterna = new[] { "001", "002", "050" }; 
-            return tiposApiExterna.Contains(tipoCodigo);
+            var usable = Math.Max(1, MaxParams - Math.Max(0, safetyMargin));
+            return Math.Max(1, usable / Math.Max(1, paramsPerRow));
         }
 
-        private async Task EnviarAApiExterna(CabeceraDto cabecera, List<DetalleDto> detalles)
+        // IMPORTANTE: no convertir a DBNull.Value; dejar null y Dapper se encarga
+        public static void Add(Dapper.DynamicParameters p, string name, object? value, DbType? dbType = null)
         {
-            try
+            // Si querés ser más defensivo con fechas “por defecto”, podés tratarlas como null:
+            if (value is DateTime dt && dt == default) value = null;
+
+            p.Add(name, value, dbType: dbType); // null -> DBNull.Value lo hace Dapper
+        }
+
+        public static IEnumerable<List<T>> ChunkBy<T>(IEnumerable<T> source, int size)
+        {
+            if (size <= 0) size = 1;
+            var bucket = new List<T>(size);
+            foreach (var item in source)
             {
-                // Convertir a formato requerido por la API externa
-                var payload = new
+                bucket.Add(item);
+                if (bucket.Count == size)
                 {
-                    numero = cabecera.Numero,
-                    fecha = cabecera.FechaEmision,
-                    cliente = cabecera.ClienteCodigo,
-                    direccion = cabecera.Direccion,
-                    areaMuelle = cabecera.AreaMuelle,
-                    items = detalles.Select(d => new
-                    {
-                        producto = d.ProductoCodigo,
-                        cantidad = d.Cantidad,
-                        lote = d.LoteCodigo
-                    })
-                };
-
-                var token = await _apiService.AuthenticateAsync();
-                await _apiService.CreateOrderAsync(token, payload);
-                
-                _logger.LogInformation("Documento {Numero} enviado a API externa", cabecera.Numero);
+                    yield return bucket;
+                    bucket = new List<T>(size);
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error enviando documento {Numero} a API externa", cabecera.Numero);
-                throw;
-            }
+            if (bucket.Count > 0)
+                yield return bucket;
         }
+    }
 
-        private async Task GuardarPedidoLocalmente(PedidoDto pedido)
-        {
-            // Convertir pedido a formato cabecera/detalle y guardar localmente
-            var cabecera = ConvertirPedidoACabecera(pedido);
-            var detalles = ConvertirPedidoADetalles(pedido);
-            
-            await InsertarEnTablasTemporales(cabecera, detalles);
-            
-            _logger.LogInformation("Pedido {Numero} guardado localmente como fallback", pedido.numero);
-        }
     }
 }
