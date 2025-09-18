@@ -16,9 +16,14 @@ namespace EsaLogistica.Api.Services
         private readonly ILogger<ValidationService> _logger;
         private readonly string? _connectionString;
 
+        // Caches por lote
         private readonly Dictionary<string, bool> _clientesCache = new();
         private readonly Dictionary<(string, string), bool> _productosCache = new();
         private readonly Dictionary<(string, string), decimal?> _stockCache = new();
+
+        // Chunking para no superar 2100 parámetros
+        private const int ClientesChunkSize = 900;   // 900 * 1 param
+        private const int ProductosChunkSize = 800;  // 800 * 2 params ~= 1600
 
         public ValidationService(ILogger<ValidationService> logger, IConfiguration configuration)
         {
@@ -28,8 +33,9 @@ namespace EsaLogistica.Api.Services
 
         public async Task ValidarLoteAsync(List<PedidoDto> pedidos)
         {
-            if (!pedidos.Any()) return;
+            if (pedidos == null || pedidos.Count == 0) return;
 
+            // Limpiar caches para el nuevo lote
             _clientesCache.Clear();
             _productosCache.Clear();
             _stockCache.Clear();
@@ -40,10 +46,11 @@ namespace EsaLogistica.Api.Services
                 .Distinct()
                 .ToList();
 
-            // AHORA: tuplas tipadas (no anonymous + dynamic)
+            // Tuplas tipadas (código, compañía)
             var productos = pedidos
-                .SelectMany(p => p.detalle)
+                .SelectMany(p => p.detalle ?? Enumerable.Empty<PedidoDetalleDto>())
                 .Select(d => (productoCodigo: d.productoCodigo, productoCompaniaCodigo: d.productoCompaniaCodigo))
+                .Where(t => !string.IsNullOrWhiteSpace(t.productoCodigo) && !string.IsNullOrWhiteSpace(t.productoCompaniaCodigo))
                 .Distinct()
                 .ToList();
 
@@ -53,82 +60,166 @@ namespace EsaLogistica.Api.Services
             await PrecargarProductosAsync(connection, productos);
 
             var productos05 = productos.Where(p => p.productoCompaniaCodigo == "05").ToList();
-            if (productos05.Any())
+            if (productos05.Count > 0)
             {
                 await PrecargarStockAsync(connection, productos05);
             }
 
-            _logger.LogInformation("Cache precargado: {ClientesCount} clientes, {ProductosCount} productos, {StockCount} stocks",
+            _logger.LogInformation(
+                "Cache precargado: {ClientesCount} clientes, {ProductosCount} productos, {StockCount} stocks",
                 _clientesCache.Count, _productosCache.Count, _stockCache.Count);
         }
 
         private async Task PrecargarClientesAsync(SqlConnection connection, List<string> clientesCodigos)
         {
-            if (!clientesCodigos.Any()) return;
+            if (clientesCodigos == null || clientesCodigos.Count == 0) return;
 
-            var parameters = string.Join(",", clientesCodigos.Select((_, i) => $"@c{i}"));
-            var dynamicParams = new DynamicParameters();
+            foreach (var chunk in Chunk(clientesCodigos, ClientesChunkSize))
+            {
+                // Particionar: numéricos vs alfanuméricos
+                var numericos = new List<(string original, int valor)>();
+                var alfas = new List<string>();
 
-            for (int i = 0; i < clientesCodigos.Count; i++)
-                dynamicParams.Add($"@c{i}", clientesCodigos[i]);
+                foreach (var c in chunk)
+                {
+                    if (IsDigitsOnly(c))
+                    {
+                        var norm = NormalizeZeros(c);
+                        // int.Parse es seguro porque norm es solo dígitos (incluye "0" si estaba vacío)
+                        numericos.Add((c, int.Parse(norm)));
+                    }
+                    else
+                    {
+                        alfas.Add(c);
+                    }
+                }
 
-            var query = $"SELECT Codigo FROM Clientes WHERE Codigo IN ({parameters})";
-            var clientesExistentes = (await connection.QueryAsync<string>(query, dynamicParams)).ToHashSet();
+                // --- Query para numéricos: compara por valor int (ignora ceros a la izquierda) ---
+                var existentesNum = new HashSet<int>();
+                if (numericos.Count > 0)
+                {
+                    var dparams = new DynamicParameters();
+                    var placeholders = new List<string>();
+                    for (int i = 0; i < numericos.Count; i++)
+                    {
+                        placeholders.Add($"@n{i}");
+                        dparams.Add($"@n{i}", numericos[i].valor, DbType.Int32);
+                    }
 
-            foreach (var codigo in clientesCodigos)
-                _clientesCache[codigo] = clientesExistentes.Contains(codigo);
+                    var sqlNum = $@"
+                        SELECT DISTINCT TRY_CONVERT(int, Codigo) AS CodigoInt
+                        FROM Clientes
+                        WHERE TRY_CONVERT(int, Codigo) IN ({string.Join(",", placeholders)})";
+
+                    var rowsNum = await connection.QueryAsync<int?>(sqlNum, dparams);
+                    foreach (var v in rowsNum)
+                        if (v.HasValue) existentesNum.Add(v.Value);
+                }
+
+                // --- Query para alfanuméricos: igualdad exacta ---
+                var existentesAlpha = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (alfas.Count > 0)
+                {
+                    var dparams = new DynamicParameters();
+                    var placeholders = new List<string>();
+                    for (int i = 0; i < alfas.Count; i++)
+                    {
+                        placeholders.Add($"@a{i}");
+                        dparams.Add($"@a{i}", alfas[i], DbType.String);
+                    }
+
+                    var sqlAlpha = $@"
+                        SELECT DISTINCT Codigo
+                        FROM Clientes
+                        WHERE Codigo IN ({string.Join(",", placeholders)})";
+
+                    var rowsAlpha = await connection.QueryAsync<string>(sqlAlpha, dparams);
+                    foreach (var s in rowsAlpha)
+                        if (!string.IsNullOrWhiteSpace(s))
+                            existentesAlpha.Add(s);
+                }
+
+                // Poblar cache con la clave ORIGINAL del pedido
+                foreach (var c in chunk)
+                {
+                    bool existe;
+                    if (IsDigitsOnly(c))
+                    {
+                        var norm = int.Parse(NormalizeZeros(c));
+                        existe = existentesNum.Contains(norm);
+                    }
+                    else
+                    {
+                        existe = existentesAlpha.Contains(c);
+                    }
+                    _clientesCache[c] = existe;
+                }
+            }
         }
 
-        // AHORA: tipado fuerte con tuplas
-        private async Task PrecargarProductosAsync(SqlConnection connection, List<(string productoCodigo, string productoCompaniaCodigo)> productos)
+        private async Task PrecargarProductosAsync(SqlConnection connection,
+            List<(string productoCodigo, string productoCompaniaCodigo)> productos)
         {
-            if (!productos.Any()) return;
+            if (productos == null || productos.Count == 0) return;
 
-            var whereConditions = new List<string>();
-            var dynamicParams = new DynamicParameters();
-
-            for (int i = 0; i < productos.Count; i++)
+            foreach (var chunk in Chunk(productos, ProductosChunkSize))
             {
-                whereConditions.Add($"(itprod = @p{i} AND itcia = @c{i})");
-                dynamicParams.Add($"@p{i}", productos[i].productoCodigo);
-                dynamicParams.Add($"@c{i}", productos[i].productoCompaniaCodigo);
-            }
+                var where = new List<string>();
+                var dparams = new DynamicParameters();
 
-            var query = $"SELECT itprod, itcia FROM Matitec WHERE ({string.Join(" OR ", whereConditions)}) ";
-            var productosExistentes = await connection.QueryAsync<(string Codigo, string Compania)>(query, dynamicParams);
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    where.Add($"(itprod = @p{i} AND itcia = @c{i})");
+                    dparams.Add($"@p{i}", chunk[i].productoCodigo);
+                    dparams.Add($"@c{i}", chunk[i].productoCompaniaCodigo);
+                }
 
-            foreach (var prod in productos)
-            {
-                var key = (prod.productoCodigo, prod.productoCompaniaCodigo);
-                _productosCache[key] = productosExistentes.Any(p => p.Codigo == prod.productoCodigo && p.Compania == prod.productoCompaniaCodigo);
+                var sql = $"SELECT itprod, itcia FROM Matitec WHERE {string.Join(" OR ", where)}";
+                var rows = (await connection.QueryAsync<(string itprod, string itcia)>(sql, dparams)).ToList();
+                var hs = rows.Select(r => (r.itprod, r.itcia)).ToHashSet();
+
+                foreach (var prod in chunk)
+                {
+                    var key = (prod.productoCodigo, prod.productoCompaniaCodigo);
+                    _productosCache[key] = hs.Contains((prod.productoCodigo, prod.productoCompaniaCodigo));
+                }
             }
         }
 
-        // AHORA: tipado fuerte con tuplas
-        private async Task PrecargarStockAsync(SqlConnection connection, List<(string productoCodigo, string productoCompaniaCodigo)> productos05)
+        private async Task PrecargarStockAsync(SqlConnection connection,
+            List<(string productoCodigo, string productoCompaniaCodigo)> productos05)
         {
-            if (!productos05.Any()) return;
+            if (productos05 == null || productos05.Count == 0) return;
 
-            var whereConditions = new List<string>();
-            var dynamicParams = new DynamicParameters();
-
-            for (int i = 0; i < productos05.Count; i++)
+            foreach (var chunk in Chunk(productos05, ProductosChunkSize))
             {
-                whereConditions.Add($"(producto = @p{i} AND cia = @c{i})");
-                dynamicParams.Add($"@p{i}", productos05[i].productoCodigo);
-                dynamicParams.Add($"@c{i}", productos05[i].productoCompaniaCodigo);
-            }
+                var where = new List<string>();
+                var dparams = new DynamicParameters();
 
-            var query = $"SELECT producto, cia, stockDisponible FROM [SAAD].[dbo].[_stock_disponible] WHERE {string.Join(" OR ", whereConditions)}";
-            var stockData = await connection.QueryAsync<(string producto, string cia, decimal stock)>(query, dynamicParams);
-            var stockList = stockData.ToList();
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    where.Add($"(producto = @p{i} AND cia = @c{i})");
+                    dparams.Add($"@p{i}", chunk[i].productoCodigo);
+                    dparams.Add($"@c{i}", chunk[i].productoCompaniaCodigo);
+                }
 
-            foreach (var prod in productos05)
-            {
-                var key = (prod.productoCodigo, prod.productoCompaniaCodigo);
-                var found = stockList.FirstOrDefault(s => s.producto == prod.productoCodigo && s.cia == prod.productoCompaniaCodigo);
-                var exists = stockList.Any(s => s.producto == prod.productoCodigo && s.cia == prod.productoCompaniaCodigo);
-                _stockCache[key] = exists ? found.stock : (decimal?)null;
+                var sql = $@"
+                    SELECT producto, cia, stockDisponible
+                    FROM [SAAD].[dbo].[_stock_disponible]
+                    WHERE {string.Join(" OR ", where)}";
+
+                var rows = (await connection.QueryAsync<(string producto, string cia, decimal stockDisponible)>(sql, dparams)).ToList();
+                var dict = new Dictionary<(string, string), decimal?>();
+                foreach (var r in rows)
+                    dict[(r.producto, r.cia)] = r.stockDisponible;
+
+                foreach (var prod in chunk)
+                {
+                    var key = (prod.productoCodigo, prod.productoCompaniaCodigo);
+                    if (!dict.TryGetValue(key, out var val))
+                        val = null; // sin registro de stock
+                    _stockCache[key] = val;
+                }
             }
         }
 
@@ -199,7 +290,7 @@ namespace EsaLogistica.Api.Services
             _logger.LogDebug("Detalle {Numero}-{Linea} validado", det.Numero, det.Linea);
         }
 
-        // AHORA: no es async; devuelve Task.CompletedTask para evitar CS1998
+        // No async => evita CS1998
         public Task ValidatePedidoTxtAsync(PedidoDto pedido)
         {
             if (string.IsNullOrWhiteSpace(pedido.numero))
@@ -238,9 +329,21 @@ namespace EsaLogistica.Api.Services
         private async Task ValidarClienteExisteAsync(string clienteCodigo)
         {
             using var connection = new SqlConnection(_connectionString);
-            var existe = await connection.QuerySingleOrDefaultAsync<bool>(
-                "SELECT CAST(CASE WHEN EXISTS(SELECT 1 FROM Clientes WHERE Codigo = @Codigo ) THEN 1 ELSE 0 END AS BIT)",
-                new { Codigo = clienteCodigo });
+
+            bool existe;
+            if (IsDigitsOnly(clienteCodigo))
+            {
+                var norm = int.Parse(NormalizeZeros(clienteCodigo));
+                existe = await connection.QuerySingleOrDefaultAsync<int>(
+                    "SELECT 1 FROM Clientes WHERE TRY_CONVERT(int, Codigo) = @v",
+                    new { v = norm }) == 1;
+            }
+            else
+            {
+                existe = await connection.QuerySingleOrDefaultAsync<int>(
+                    "SELECT 1 FROM Clientes WHERE Codigo = @Codigo",
+                    new { Codigo = clienteCodigo }) == 1;
+            }
 
             if (!existe)
                 throw new Exception($"Cliente {clienteCodigo} no existe");
@@ -249,9 +352,9 @@ namespace EsaLogistica.Api.Services
         private async Task ValidarProductoExisteAsync(string productoCodigo, string companiaCodigo)
         {
             using var connection = new SqlConnection(_connectionString);
-            var existe = await connection.QuerySingleOrDefaultAsync<bool>(
-                "SELECT CAST(CASE WHEN EXISTS(SELECT 1 FROM Matitec WHERE Itprod = @Codigo AND Itcia = @Compania ) THEN 1 ELSE 0 END AS BIT)",
-                new { Codigo = productoCodigo, Compania = companiaCodigo });
+            var existe = await connection.QuerySingleOrDefaultAsync<int>(
+                "SELECT 1 FROM Matitec WHERE Itprod = @Codigo AND Itcia = @Compania",
+                new { Codigo = productoCodigo, Compania = companiaCodigo }) == 1;
 
             if (!existe)
                 throw new Exception($"Producto {productoCodigo} no existe para compañía {companiaCodigo}");
@@ -270,6 +373,39 @@ namespace EsaLogistica.Api.Services
 
             if (stockDisponible.Value < det.Cantidad)
                 throw new Exception($"Stock insuficiente para {det.ProductoCodigo}: Disponible {stockDisponible.Value}, Solicitado {det.Cantidad}");
+        }
+
+        // ----------------- Helpers -----------------
+        private static IEnumerable<List<T>> Chunk<T>(IEnumerable<T> source, int size)
+        {
+            var list = new List<T>(size);
+            foreach (var item in source)
+            {
+                list.Add(item);
+                if (list.Count == size)
+                {
+                    yield return list;
+                    list = new List<T>(size);
+                }
+            }
+            if (list.Count > 0) yield return list;
+        }
+
+        private static bool IsDigitsOnly(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            for (int i = 0; i < s.Length; i++)
+                if (s[i] < '0' || s[i] > '9') return false;
+            return true;
+        }
+
+        private static string NormalizeZeros(string s)
+        {
+            // Solo para numéricos: quita ceros a la izquierda; si queda vacío => "0"
+            var i = 0;
+            while (i < s.Length && s[i] == '0') i++;
+            var res = s.Substring(i);
+            return res.Length == 0 ? "0" : res;
         }
     }
 }

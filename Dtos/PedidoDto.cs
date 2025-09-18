@@ -18,6 +18,8 @@ namespace EsaLogistica.Api.Dtos
         public string razonSocial { get; set; } = "";
         public string domicilio { get; set; } = "";
         public string? localidadCodigo { get; set; }
+        public string? localidadNombre { get; set; }
+        public string? codigoPostal { get; set; }
         public string? provincia { get; set; }
         public decimal importeFactura { get; set; }
         public int prioridad { get; set; }

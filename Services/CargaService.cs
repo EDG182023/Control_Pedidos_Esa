@@ -200,7 +200,7 @@ namespace EsaLogistica.Api.Services
                     var detalles = ConvertirPedidoADetalles(pedido);
 
                     // Asignar área de muelle desde cache
-                    var cacheKey = $"{cabecera.Direccion}|{cabecera.SubClienteCodigo}|{cabecera.LocalidadNombre}|{cabecera.ClienteCodigo}";
+                    var cacheKey = $"{cabecera.Direccion}|{cabecera.SubClienteCodigo}|{cabecera.CodigoPostal}|{cabecera.ClienteCodigo}";
                     cabecera.AreaMuelle = areasCache.GetValueOrDefault(cacheKey, "GENERAL");
 
                     cabecerasParaInsertar.Add(cabecera);
@@ -224,34 +224,37 @@ namespace EsaLogistica.Api.Services
             return (procesados, etapasInsertadas, errores);
         }
 
-        private async Task PrecargarAreasMuelle(Dictionary<string, string> cache)
+       private async Task PrecargarAreasMuelle(Dictionary<string, string> cache)
         {
-            // Extraer combinaciones únicas de criterios de área de muelle
-            var criterios = _pedidosTemp.Select(p => new
+            var criterios = _pedidosTemp.Select(p =>
             {
-                Direccion = ConvertirPedidoACabecera(p).Direccion,
-                SubClienteCodigo = ConvertirPedidoACabecera(p).SubClienteCodigo,
-                LocalidadNombre = ConvertirPedidoACabecera(p).LocalidadNombre,
-                ClienteCodigo = ConvertirPedidoACabecera(p).ClienteCodigo
+                var cab = ConvertirPedidoACabecera(p);
+                return new
+                {
+                    cab.Direccion,
+                    cab.SubClienteCodigo,
+                    cab.CodigoPostal,
+                    cab.ClienteCodigo
+                };
             }).Distinct().ToList();
 
-            foreach (var criterio in criterios)
+            foreach (var c in criterios)
             {
                 try
                 {
                     var area = await _muelleService.ObtenerAreaMuelleAsync(
-                        criterio.Direccion ?? string.Empty,
-                        criterio.SubClienteCodigo,
-                        criterio.LocalidadNombre,
-                        criterio.ClienteCodigo);
+                        c.Direccion ?? string.Empty,
+                        c.SubClienteCodigo,
+                        c.CodigoPostal,
+                        c.ClienteCodigo);
 
-                    var cacheKey = $"{criterio.Direccion}|{criterio.SubClienteCodigo}|{criterio.LocalidadNombre}|{criterio.ClienteCodigo}";
+                    var cacheKey = $"{c.Direccion}|{c.SubClienteCodigo}|{c.CodigoPostal}|{c.ClienteCodigo}";
                     cache[cacheKey] = area ?? "GENERAL";
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning("Error obteniendo área muelle: {Error}", ex.Message);
-                    var cacheKey = $"{criterio.Direccion}|{criterio.SubClienteCodigo}|{criterio.LocalidadNombre}|{criterio.ClienteCodigo}";
+                    var cacheKey = $"{c.Direccion}|{c.SubClienteCodigo}|{c.CodigoPostal}|{c.ClienteCodigo}";
                     cache[cacheKey] = "GENERAL";
                 }
             }
@@ -426,10 +429,14 @@ namespace EsaLogistica.Api.Services
 
                     var detallesAsociados = _detallesTemp.Where(d => d.Numero == cabecera.Numero).ToList();
 
-                    if (!detallesAsociados.Any())
+                                        // Si el tipo NO es "10", exigimos que existan detalles
+                    if (!string.Equals(cabecera.TipoCodigo, "10", StringComparison.Ordinal))
                     {
-                        errores.Add($"No se encontraron detalles para cabecera {cabecera.Numero}");
-                        continue;
+                        if (!detallesAsociados.Any())
+                        {
+                            errores.Add($"No se encontraron detalles para cabecera {cabecera.Numero}");
+                            continue;
+                        }
                     }
 
                     await InsertarEnTablasTemporales(cabecera, detallesAsociados);
@@ -474,11 +481,11 @@ namespace EsaLogistica.Api.Services
                         CodigoPostal = sheet.Cells[row, 15].Text?.Trim(),
                         Direccion = sheet.Cells[row, 16].Text?.Trim(),
                         ValorDeclarado = decimal.TryParse(sheet.Cells[row, 17].Text, out var vd) ? vd : null,
-                        ReferenciaA = string.IsNullOrWhiteSpace(sheet.Cells[row, 18].Text) ? null : sheet.Cells[row, 18].Text.Trim(),
-                        ReferenciaB = string.IsNullOrWhiteSpace(sheet.Cells[row, 19].Text) ? null : sheet.Cells[row, 19].Text.Trim(),
-                        Observaciones = string.IsNullOrWhiteSpace(sheet.Cells[row, 20].Text) ? null : sheet.Cells[row, 20].Text.Trim(),
-                        Telefono = string.IsNullOrWhiteSpace(sheet.Cells[row, 21].Text) ? null : sheet.Cells[row, 21].Text.Trim(),
-                        Email = string.IsNullOrWhiteSpace(sheet.Cells[row, 22].Text) ? null : sheet.Cells[row, 22].Text.Trim()
+                        ReferenciaA = string.IsNullOrWhiteSpace(sheet.Cells[row, 19].Text) ? null : sheet.Cells[row, 19].Text.Trim(),
+                        ReferenciaB = string.IsNullOrWhiteSpace(sheet.Cells[row, 20].Text) ? null : sheet.Cells[row, 20].Text.Trim(),
+                        Observaciones = string.IsNullOrWhiteSpace(sheet.Cells[row, 21].Text) ? null : sheet.Cells[row, 21].Text.Trim(),
+                        Telefono = string.IsNullOrWhiteSpace(sheet.Cells[row, 22].Text) ? null : sheet.Cells[row, 22].Text.Trim(),
+                        Email = string.IsNullOrWhiteSpace(sheet.Cells[row, 23].Text) ? null : sheet.Cells[row, 23].Text.Trim()
                     };
 
                     try
@@ -557,8 +564,8 @@ namespace EsaLogistica.Api.Services
                 SubClienteCodigo = pedido.subClienteCodigo,
                 RazonSocial = pedido.razonSocial,
                 Direccion = pedido.domicilio,
-                LocalidadNombre = pedido.localidadCodigo,
-                CodigoPostal = "",
+                LocalidadNombre = pedido.localidadNombre,
+                CodigoPostal = pedido.codigoPostal,
                 ValorDeclarado = pedido.importeFactura,
                 ReferenciaA = pedido.referenciaA,
                 ReferenciaB = pedido.referenciaB,
